@@ -1,0 +1,36 @@
+*{
+    text-align: center;
+}
+table{
+    margin: auto;
+    width: 50%;
+}
+thead{
+    color: yellow;
+    background-color: blue;
+}
+tbody{
+    background-color: lightcyan;
+}
+.linha{
+    width: 90%;
+    display: flex;
+}
+.col-maior{
+    flex: 70%;
+}
+.col-menor{
+    padding: 50px;
+    flex: 30%;
+}
+img{
+    width: 100%;
+    height: 100%;
+}
+a{
+    text-decoration: none;
+    border-radius: 25px;
+    background-color: blue;
+    color: yellow;
+    padding: 10px;
+}
