@@ -7,4 +7,4 @@ O arquivo [CxEletronico.c](https://github.com/cfprocha/diversos/blob/main/CxElet
 
 Os arquivos [CxEletr.html](https://github.com/cfprocha/diversos/blob/main/CxEletr.html) e [CxEletr.js](https://github.com/cfprocha/diversos/blob/main/CxEletr.js) representam respectivamente a página web para a solução do caixa eletrônico e o código JavaScript que soluciona o problema. Essa versão é ainda mais enxuta do que a realizada com a linguagem C. 
 
-Os arquivos da pasta [cadastro](github.com/cfprocha/diversos/cadastro/blob/main/index.php) representam uma aplicação muito simples de cadastro de nome e idade, em PHP com MariaDB.
+Os arquivos da pasta [cadastro](github.com/cfprocha/diversos/cadastro/index.php) representam uma aplicação muito simples de cadastro de nome e idade, em PHP com MariaDB.
