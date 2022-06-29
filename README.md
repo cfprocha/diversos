@@ -6,3 +6,5 @@ O arquivo [lst_tar.sh](https://github.com/cfprocha/diversos/blob/main/lst_tar.sh
 O arquivo [CxEletronico.c](https://github.com/cfprocha/diversos/blob/main/CxEletronico.c) apresenta a solução de um problema muito comum nas aulas de linguagens de programação. O programa para definir a quantidade de notas, de cada tipo, que um caixa eletrônico deve fornecer, de acordo com o valor solicitado. Solução criada na linguagem C.
 
 Os arquivos [CxEletr.html](https://github.com/cfprocha/diversos/blob/main/CxEletr.html) e [CxEletr.js](https://github.com/cfprocha/diversos/blob/main/CxEletr.js) representam respectivamente a página web para a solução do caixa eletrônico e o código JavaScript que soluciona o problema. Essa versão é ainda mais enxuta do que a realizada com a linguagem C. 
+
+Os arquivos da pasta [cadastro](github.com/cfprocha/diversos/cadastro/blob/main/index.php) representam uma aplicação muito simples de cadastro de nome e idade, em PHP com MariaDB.
