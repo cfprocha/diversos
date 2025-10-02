@@ -3,7 +3,6 @@
 //   cc -O2 -Wall -I/usr/local/include -L/usr/local/lib -lusb \
 //      -o /usr/local/bin/s1panel_freebsd /usr/local/src/s1panel_freebsd.c
 
-#define _POSIX_C_SOURCE 200809L
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
