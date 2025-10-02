@@ -1,244 +1,435 @@
-// s1panel_freebsd.c — ACEMAGIC S1 (Holtek 04D9:FD01) — FreeBSD/OPNsense
-// Compilar na VM FreeBSD e copiar o binário p/ OPNsense:
-//   cc -O2 -Wall -I/usr/local/include -L/usr/local/lib -lusb \
-//      -o /usr/local/bin/s1panel_freebsd /usr/local/src/s1panel_freebsd.c
+/*
+ * ACEMAGIC S1 (Holtek 04d9:fd01) - FreeBSD system stats to front LCD
+ * Protocolo baseado em: https://github.com/tjaworski/AceMagic-S1-LED-TFT-Linux
+ * - Pacote sempre 4104 bytes: 8 de header + 4096 dados
+ * - Comandos: set_orientation (0xA1 0xF1), set_time/heartbeat (0xA1 0xF2/F3),
+ *             redraw (0xA3 F0/F1/F2), update (0xA2) — aqui usamos redraw completo.
+ * - Framebuffer: 320x170 RGB565, endian swap no envio. 108800 bytes por frame.
+ *
+ * Requisitos: FreeBSD 13+/14+, /dev/uhidN acessível (IF#1 do 04d9:fd01).
+ */
 
-#include <sys/types.h>
+#define _WITH_GETLINE
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <sys/sysctl.h>
+#include <sys/types.h>
 #include <sys/time.h>
-#include <err.h>
-#include <libusb.h>
-#include <stdio.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdint.h>
-#include <stdbool.h>
-#include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
-#define VID 0x04d9
-#define PID 0xfd01
+/* ===================== Config / Const ===================== */
 
-// Painel físico: 320x170 (LANDSCAPE), RGB565 little-endian (lo,hi)
-#define LCD_W 320
-#define LCD_H 170
-#define FB_SIZE (LCD_W*LCD_H*2)
+#define UHID_PATH          "/dev/uhid1"   /* ajuste se necessário */
+#define WIDTH              320
+#define HEIGHT             170
+#define BPP                2              /* RGB565 = 2 bytes */
+#define FRAME_BYTES        (WIDTH*HEIGHT*BPP) /* 108800 */
+#define CHUNK_DATA         4096
+#define PKT_SIZE           (8 + CHUNK_DATA)   /* 4104 */
+#define REDRAW_BLOCKS      27             /* 26x4096 + 2304 */
+#define HEARTBEAT_MS       1000
+#define UPDATE_MS          1000
 
-// Framebuffer de desenho (RETRATO) para facilitar texto legível e depois rotacionar
-#define PR_W 170
-#define PR_H 320
-#define PR_SIZE (PR_W*PR_H*2)
+/* Header helpers */
+#define SIG_BYTE           0x55
 
-#define CHUNK_DATA   4096
-#define CHUNKS_FULL  26
-#define CHUNK_LAST   2304
-#define TOTAL_CHUNKS 27
+/* Byte-order swap para RGB565 (16-bit) */
+static inline uint16_t bswap16(uint16_t v){ return (uint16_t)((v>>8) | (v<<8)); }
 
-// ---- fonte 5x7 (subset) ----
-static const uint8_t font5x7[][7] = {
- {0x00,0x00,0x00,0x00,0x00}, // [32] espaço
- {0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},
- {0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},
- {0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},
- {0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
- {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},
- {0x00,0x36,0x36,0x00,0x00}, // ':'
- {0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},
- {0x3E,0x41,0x41,0x41,0x22},{0x7F,0x41,0x41,0x22,0x1C},
- {0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},
- {0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},
- {0x00,0x41,0x7F,0x41,0x00},{0x20,0x40,0x41,0x3F,0x01},
- {0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},
- {0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},
- {0x3E,0x41,0x41,0x41,0x3E},{0x7F,0x09,0x09,0x09,0x06},
- {0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},
- {0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},
- {0x3F,0x40,0x40,0x40,0x3F},{0x1F,0x20,0x40,0x20,0x1F},
- {0x7F,0x20,0x18,0x20,0x7F},{0x63,0x14,0x08,0x14,0x63},
- {0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43}
+/* RGB565 macro (5 bits R, 6 G, 5 B) */
+static inline uint16_t rgb565(uint8_t r5, uint8_t g6, uint8_t b5){
+    return (uint16_t)(((r5 & 0x1F) << 11) | ((g6 & 0x3F) << 5) | (b5 & 0x1F));
+}
+
+/* Conveniência: converte 8-bit por canal (0..255) para 5/6/5 */
+static inline uint16_t rgb_u8(uint8_t r, uint8_t g, uint8_t b){
+    return rgb565((uint8_t)(r>>3),(uint8_t)(g>>2),(uint8_t)(b>>3));
+}
+
+/* ===================== UHID I/O ===================== */
+
+static int lcd_fd = -1;
+
+/* write_all: garante envio integral */
+static bool write_all(int fd, const void *buf, size_t len){
+    const uint8_t *p = (const uint8_t*)buf;
+    while (len > 0){
+        ssize_t w = write(fd, p, len);
+        if (w < 0){
+            if (errno == EINTR) continue;
+            perror("write");
+            return false;
+        }
+        p += (size_t)w;
+        len -= (size_t)w;
+    }
+    return true;
+}
+
+/* set_orientation: 0x55 0xA1 0xF1 <orient> 00 00 00 00 + padding 4096 zerada */
+static bool lcd_set_orientation(uint8_t orientation){
+    uint8_t pkt[PKT_SIZE];
+    memset(pkt, 0, sizeof pkt);
+    pkt[0] = SIG_BYTE;
+    pkt[1] = 0xA1;
+    pkt[2] = 0xF1;
+    pkt[3] = orientation; /* 0x01 landscape, 0x02 portrait */
+
+    return write_all(lcd_fd, pkt, sizeof pkt);
+}
+
+/* set_time / heartbeat: 0x55 0xA1 0xF2 <hh> <mm> <ss> 00 00 + padding */
+static bool lcd_set_time_or_heartbeat(bool set_time){
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+
+    uint8_t pkt[PKT_SIZE];
+    memset(pkt, 0, sizeof pkt);
+    pkt[0] = SIG_BYTE;
+    pkt[1] = 0xA1;
+    pkt[2] = set_time ? 0xF3 : 0xF2;
+    pkt[3] = (uint8_t)tm.tm_hour;
+    pkt[4] = (uint8_t)tm.tm_min;
+    pkt[5] = (uint8_t)tm.tm_sec;
+
+    return write_all(lcd_fd, pkt, sizeof pkt);
+}
+
+/* redraw completo (framebuffer 320x170 RGB565 com swap endian) */
+static bool lcd_redraw(const uint8_t *frame /* 108800 bytes */){
+    /* Envia 26 blocos de 4096 e 1 bloco final de 2304 */
+    size_t remaining = FRAME_BYTES;
+    size_t sent_off = 0;
+
+    for (int seq = 1; seq <= REDRAW_BLOCKS; seq++){
+        uint8_t pkt[PKT_SIZE];
+        memset(pkt, 0, sizeof pkt);
+
+        pkt[0] = SIG_BYTE;
+        pkt[1] = 0xA3;
+        pkt[2] = (seq == 1) ? 0xF0 : (seq == REDRAW_BLOCKS ? 0xF2 : 0xF1);
+        pkt[3] = (uint8_t)seq;
+
+        /* offset/length “documentais”; firmware usa ‘sequence’ (README) */
+        /* offset em múltiplos de 0x10 = 4096; último bloco usa 2304 (0x0900) */
+        uint16_t off16 = (uint16_t)((sent_off / CHUNK_DATA) * 0x10);
+        uint16_t len16 = (uint16_t)((remaining >= CHUNK_DATA) ? 0x10 : 0x09); /* 0x10=4096, 0x09=2304 */
+        pkt[4] = (uint8_t)(off16 & 0xFF);
+        pkt[5] = (uint8_t)((off16 >> 8) & 0xFF);
+        pkt[6] = (uint8_t)(len16 & 0xFF);
+        pkt[7] = (uint8_t)((len16 >> 8) & 0xFF);
+
+        size_t this_data = (remaining >= CHUNK_DATA) ? CHUNK_DATA : 2304;
+        memcpy(pkt + 8, frame + sent_off, this_data);
+        /* resto do data já está zerado por memset */
+
+        if (!write_all(lcd_fd, pkt, sizeof pkt)) return false;
+
+        sent_off += this_data;
+        if (remaining >= this_data) remaining -= this_data; else remaining = 0;
+    }
+    return (remaining == 0);
+}
+
+/* ===================== Métricas FreeBSD ===================== */
+
+enum { CP_USER = 0, CP_NICE, CP_SYS, CP_INTR, CP_IDLE, CPUSTATES = 5 };
+
+static bool get_cpu_times(uint64_t out_times[CPUSTATES]){
+    long raw[CPUSTATES]={0};
+    size_t sraw = sizeof(raw);
+    if (sysctlbyname("kern.cp_time", &raw, &sraw, NULL, 0) != 0) return false;
+    for (int i=0;i<CPUSTATES;i++) out_times[i]=(uint64_t)raw[i];
+    return true;
+}
+
+static double get_cpu_percent(void){
+    static bool inited=false;
+    static uint64_t prev[CPUSTATES]={0};
+    uint64_t now[CPUSTATES];
+    if (!get_cpu_times(now)) return 0.0;
+
+    if (!inited){
+        inited=true; memcpy(prev, now, sizeof prev);
+        usleep(150000);
+        if (!get_cpu_times(now)) return 0.0;
+    }
+    uint64_t diff[CPUSTATES]={0}, total=0;
+    for (int i=0;i<CPUSTATES;i++){ diff[i]=now[i]-prev[i]; total+=diff[i]; prev[i]=now[i]; }
+    if (!total) return 0.0;
+    double used = 100.0 * (double)(diff[CP_USER]+diff[CP_NICE]+diff[CP_SYS]+diff[CP_INTR]) / (double)total;
+    return used;
+}
+
+typedef struct { uint64_t total, used, avail; } mem_info_t;
+static bool get_mem_info(mem_info_t *mi){
+    if (!mi) return false;
+    int page_size=0; size_t psz=sizeof(page_size);
+    if (sysctlbyname("hw.pagesize",&page_size,&psz,NULL,0)!=0) return false;
+    uint64_t v_page_count=0,v_free=0,v_active=0,v_inactive=0,v_cache=0,v_wire=0; size_t sz=sizeof(uint64_t);
+    if (sysctlbyname("vm.stats.vm.v_page_count",&v_page_count,&sz,NULL,0)!=0) return false;
+    if (sysctlbyname("vm.stats.vm.v_free_count",&v_free,&sz,NULL,0)!=0) return false;
+    if (sysctlbyname("vm.stats.vm.v_active_count",&v_active,&sz,NULL,0)!=0) return false;
+    if (sysctlbyname("vm.stats.vm.v_inactive_count",&v_inactive,&sz,NULL,0)!=0) return false;
+    if (sysctlbyname("vm.stats.vm.v_cache_count",&v_cache,&sz,NULL,0)!=0) return false;
+    if (sysctlbyname("vm.stats.vm.v_wire_count",&v_wire,&sz,NULL,0)!=0) return false;
+    mi->total = v_page_count * (uint64_t)page_size;
+    mi->used  = (v_active + v_wire) * (uint64_t)page_size;
+    mi->avail = (v_free + v_inactive + v_cache) * (uint64_t)page_size;
+    return true;
+}
+
+typedef struct { uint64_t total, used, avail; } disk_info_t;
+static bool get_disk_root(disk_info_t *di){
+    struct statfs sfs;
+    if (statfs("/", &sfs)!=0) return false;
+    uint64_t bsize=sfs.f_bsize, blocks=sfs.f_blocks, bfree=sfs.f_bfree, bavail=sfs.f_bavail;
+    di->total = blocks*bsize;
+    di->used  = (blocks-bfree)*bsize;
+    di->avail = bavail*bsize;
+    return true;
+}
+
+static double read_temp_c(void){
+    /* Tenta chaves comuns */
+    const char *keys[] = {"dev.cpu.0.temperature","hw.acpi.thermal.tz0.temperature","hw.acpi.thermal.tz1.temperature",NULL};
+    for (int i=0; keys[i]; i++){
+        double d; size_t sz=sizeof(d);
+        if (sysctlbyname(keys[i], &d, &sz, NULL, 0)==0) return d; /* geralmente já vem em °C */
+        /* tenta como string */
+        char buf[64]; sz=sizeof(buf);
+        if (sysctlbyname(keys[i], &buf, &sz, NULL, 0)==0){
+            char *end=NULL; double v=strtod(buf,&end);
+            if (end && *end=='K') return v-273.15;
+            return v;
+        }
+    }
+    return -273.15;
+}
+
+/* ===================== Renderização (fonte 5x7) ===================== */
+
+/* Fonte 5x7 minimalista para letras usadas + dígitos (ASCII parcial)
+ * Cada char: 5 colunas x 7 linhas, 1 bit por pixel em cada coluna (LSB = topo)
+ * Ajuste/adicione se quiser mais caracteres.
+ */
+typedef struct { char ch; uint8_t col[5]; } glyph_t;
+
+/* Dígitos 0-9, símbolos básicos e letras necessárias (C,P,U,R,A,M,D,I,S,K,T,E,F,/,%,:,.,space) */
+static const glyph_t FONT[] = {
+    {' ', {0x00,0x00,0x00,0x00,0x00}},
+    {':', {0x00,0x14,0x00,0x14,0x00}},
+    {'.', {0x00,0x00,0x00,0x10,0x00}},
+    {'/', {0x01,0x02,0x04,0x08,0x10}},
+    {'%', {0x61,0x62,0x04,0x19,0x31}},
+    {'0', {0x3E,0x51,0x49,0x45,0x3E}},
+    {'1', {0x00,0x42,0x7F,0x40,0x00}},
+    {'2', {0x62,0x51,0x49,0x49,0x46}},
+    {'3', {0x22,0x41,0x49,0x49,0x36}},
+    {'4', {0x18,0x14,0x12,0x7F,0x10}},
+    {'5', {0x27,0x45,0x45,0x45,0x39}},
+    {'6', {0x3E,0x49,0x49,0x49,0x32}},
+    {'7', {0x01,0x71,0x09,0x05,0x03}},
+    {'8', {0x36,0x49,0x49,0x49,0x36}},
+    {'9', {0x26,0x49,0x49,0x49,0x3E}},
+    {'A', {0x7E,0x11,0x11,0x11,0x7E}},
+    {'C', {0x3E,0x41,0x41,0x41,0x22}},
+    {'D', {0x7F,0x41,0x41,0x22,0x1C}},
+    {'E', {0x7F,0x49,0x49,0x49,0x41}},
+    {'F', {0x7F,0x09,0x09,0x09,0x01}},
+    {'I', {0x00,0x41,0x7F,0x41,0x00}},
+    {'K', {0x7F,0x08,0x14,0x22,0x41}},
+    {'M', {0x7F,0x02,0x0C,0x02,0x7F}},
+    {'P', {0x7F,0x09,0x09,0x09,0x06}},
+    {'R', {0x7F,0x09,0x19,0x29,0x46}},
+    {'S', {0x26,0x49,0x49,0x49,0x32}},
+    {'T', {0x01,0x01,0x7F,0x01,0x01}},
+    {'U', {0x3F,0x40,0x40,0x40,0x3F}},
 };
 
-static inline uint16_t RGB565(uint8_t r8, uint8_t g8, uint8_t b8){
-    uint16_t r = (r8 >> 3) & 0x1F;
-    uint16_t g = (g8 >> 2) & 0x3F;
-    uint16_t b = (b8 >> 3) & 0x1F;
-    return (uint16_t)((r<<11) | (g<<5) | b);
-}
-static inline void putpx_le(uint8_t *fb, int w, int h, int x, int y, uint16_t c){
-    if (x<0||x>=w||y<0||y>=h) return;
-    size_t off = (y*w + x)*2;
-    fb[off]   = (uint8_t)(c & 0xFF);   // little-endian por pixel
-    fb[off+1] = (uint8_t)(c >> 8);
-}
-static void fb_clear(uint8_t *fb, int w, int h, uint16_t c){
-    uint8_t lo = c & 0xFF, hi = c >> 8;
-    for (size_t i=0;i<(size_t)w*h*2;i+=2){ fb[i]=lo; fb[i+1]=hi; }
-}
-static void draw_char(uint8_t *fb, int x, int y, char ch, int scale, uint16_t fg, uint16_t bg){
-    const uint8_t *g=NULL;
-    if (ch==' '){
-        for(int dx=0; dx<6*scale; ++dx)
-            for(int dy=0; dy<7*scale; ++dy)
-                putpx_le(fb,PR_W,PR_H,x+dx,y+dy,bg);
-        return;
-    }
-    if (ch>='0'&&ch<='9') g=font5x7[(ch-'0')+(48-32)];
-    else if (ch==':')     g=font5x7[(58-32)];
-    else { char up=(ch>='a'&&ch<='z')?(ch-32):ch;
-           if (up>='A'&&up<='Z') g=font5x7[(up-'A')+(65-32)]; }
-    if (!g){
-        for(int dx=0; dx<6*scale; ++dx)
-            for(int dy=0; dy<7*scale; ++dy)
-                putpx_le(fb,PR_W,PR_H,x+dx,y+dy,bg);
-        return;
-    }
-    for (int c=0;c<5;c++){
-        uint8_t bits=g[c];
-        for (int r=0;r<7;r++){
-            uint16_t col=((bits>>r)&1U)?fg:bg;
-            for(int sx=0;sx<scale;sx++)
-                for(int sy=0;sy<scale;sy++)
-                    putpx_le(fb,PR_W,PR_H,x+c*scale+sx,y+r*scale+sy,col);
-        }
-    }
-    for(int sx=0;sx<scale;sx++)
-        for(int sy=0;sy<7*scale;sy++)
-            putpx_le(fb,PR_W,PR_H,x+5*scale+sx,y+sy,bg);
-}
-static void draw_text(uint8_t *fb, int x, int y, const char *s, int scale, uint16_t fg, uint16_t bg){
-    int cx=x; while(*s){ draw_char(fb,cx,y,*s,scale,fg,bg); cx+=6*scale; s++; }
+static const glyph_t* find_glyph(char c){
+    size_t n = sizeof(FONT)/sizeof(FONT[0]);
+    for (size_t i=0;i<n;i++) if (FONT[i].ch==c) return &FONT[i];
+    return &FONT[0]; /* space fallback */
 }
 
-// ROTACIONA retrato PR_W×PR_H para landscape LCD_W×LCD_H (90° CW)
-static void rotate_portrait_to_landscape(const uint8_t *src, uint8_t *dst){
-    for (int y=0; y<PR_H; ++y){
-        for (int x=0; x<PR_W; ++x){
-            size_t s_off = (y*PR_W + x)*2;
-            int dx = LCD_W - 1 - y;     // x' = W-1 - y
-            int dy = x;                  // y' = x
-            size_t d_off = (dy*LCD_W + dx)*2;
-            dst[d_off]   = src[s_off];
-            dst[d_off+1] = src[s_off+1];
+static void put_pixel(uint8_t *fb, int x, int y, uint16_t color){
+    if (x<0 || x>=WIDTH || y<0 || y>=HEIGHT) return;
+    size_t idx = (size_t)((y*WIDTH + x) * 2);
+    /* endian swap exigido pelo dispositivo */
+    *(uint16_t*)(fb + idx) = bswap16(color);
+}
+
+/* Desenha char 5x7, com espaçamento 1px, altura 7 */
+static void draw_char(uint8_t *fb, int x, int y, char c, uint16_t fg, uint16_t bg){
+    const glyph_t *g = find_glyph(c);
+    for (int col=0; col<5; col++){
+        uint8_t bits = g->col[col];
+        for (int row=0; row<7; row++){
+            bool on = (bits >> row) & 0x1;
+            put_pixel(fb, x+col, y+row, on?fg:bg);
+        }
+    }
+    /* coluna de espaçamento */
+    for (int row=0; row<7; row++) put_pixel(fb, x+5, y+row, bg);
+}
+
+/* Desenha string */
+static void draw_text(uint8_t *fb, int x, int y, const char *s, uint16_t fg, uint16_t bg){
+    int cx = x;
+    for (; *s; s++){
+        draw_char(fb, cx, y, *s, fg, bg);
+        cx += 6;
+    }
+}
+
+/* Retângulo cheio */
+static void fill_rect(uint8_t *fb, int x, int y, int w, int h, uint16_t color){
+    if (w<=0||h<=0) return;
+    int x2 = x+w, y2 = y+h;
+    if (x<0) x=0; if (y<0) y=0; if (x2>WIDTH) x2=WIDTH; if (y2>HEIGHT) y2=HEIGHT;
+    for (int yy=y; yy<y2; yy++){
+        size_t off = (size_t)((yy*WIDTH + x)*2);
+        for (int xx=x; xx<x2; xx++){
+            *(uint16_t*)(fb+off) = bswap16(color);
+            off += 2;
         }
     }
 }
 
-// --------- métricas ----------
-static void get_uptime(char *buf, size_t n){
-    struct timespec bt; size_t len=sizeof(bt);
-    if (sysctlbyname("kern.boottime",&bt,&len,NULL,0)==0){
-        time_t now=time(NULL), up=now-bt.tv_sec;
-        int d=up/86400, h=(up%86400)/3600, m=(up%3600)/60;
-        snprintf(buf,n,"UPTIME %dd %02d:%02d",d,h,m);
-    } else snprintf(buf,n,"UPTIME ?");
-}
-static void get_load(char *buf, size_t n){
-    double l[3]; if (getloadavg(l,3)>=0)
-        snprintf(buf,n,"LOAD %.2f %.2f %.2f",l[0],l[1],l[2]);
-    else snprintf(buf,n,"LOAD ?");
+/* Barra horizontal  (0..100) */
+static void draw_bar(uint8_t *fb, int x, int y, int w, int h, int pct, uint16_t fg, uint16_t bg, uint16_t frame){
+    fill_rect(fb, x, y, w, h, bg);
+    int fill = (pct<0?0:(pct>100?100:pct)) * w / 100;
+    fill_rect(fb, x, y, fill, h, fg);
+    /* moldura fina */
+    for (int xx=x; xx<x+w; xx++){ put_pixel(fb, xx, y, frame); put_pixel(fb, xx, y+h-1, frame); }
+    for (int yy=y; yy<y+h; yy++){ put_pixel(fb, x, yy, frame); put_pixel(fb, x+w-1, yy, frame); }
 }
 
-// --------- USB ----------
-struct usb_out { libusb_device_handle *h; int ifnum; unsigned char ep_out; };
+/* ===================== Helpers ===================== */
 
-static int find_hid_out(libusb_device_handle *h, struct usb_out *o){
-    libusb_device *dev=libusb_get_device(h);
-    struct libusb_config_descriptor *cfg=NULL;
-    if (libusb_get_active_config_descriptor(dev,&cfg)!=0) return -1;
-    int ok=-1;
-    for(int i=0;i<cfg->bNumInterfaces&&ok==-1;i++){
-        const struct libusb_interface *itf=&cfg->interface[i];
-        for(int a=0;a<itf->num_altsetting&&ok==-1;a++){
-            const struct libusb_interface_descriptor *alt=&itf->altsetting[a];
-            if (alt->bInterfaceClass==0x03){ // HID
-                for(int e=0;e<alt->bNumEndpoints;e++){
-                    const struct libusb_endpoint_descriptor *ep=&alt->endpoint[e];
-                    if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_OUT){
-                        o->ifnum=alt->bInterfaceNumber; o->ep_out=ep->bEndpointAddress; ok=0; break;
-                    }
-                }
-            }
-        }
-    }
-    if (cfg) libusb_free_config_descriptor(cfg);
-    return ok;
-}
-static int xfer(libusb_device_handle *h, unsigned char ep, const void *buf, int len){
-    int x=0,r=libusb_interrupt_transfer(h,ep,(unsigned char*)buf,len,&x,1000);
-    return (r==0 && x==len)?0:-1;
-}
-static int send_packet(struct usb_out *o, const uint8_t hdr[8], const uint8_t *data, int datalen){
-    static uint8_t buf[8+CHUNK_DATA];
-    if (datalen>CHUNK_DATA) datalen=CHUNK_DATA;
-    memcpy(buf,hdr,8);
-    if (datalen>0) memcpy(buf+8,data,datalen);
-    if (datalen<CHUNK_DATA) memset(buf+8+datalen,0,CHUNK_DATA-datalen);
-    return xfer(o->h,o->ep_out,buf,8+CHUNK_DATA);
-}
-static int cmd_orientation(struct usb_out *o, uint8_t mode){ // 0x02 = landscape (no teu painel)
-    uint8_t hdr[8]={0x55,0xA1,0xF1,mode,0,0,0,0}; return send_packet(o,hdr,NULL,0);
-}
-static int cmd_time(struct usb_out *o, const struct tm *tmn){
-    uint8_t hdr[8]={0x55,0xA1,0xF2,(uint8_t)tmn->tm_hour,(uint8_t)tmn->tm_min,(uint8_t)tmn->tm_sec,0,0};
-    return send_packet(o,hdr,NULL,0);
-}
-static int cmd_redraw_27(struct usb_out *o, const uint8_t *fb){
-    size_t off=0;
-    for(int i=0;i<TOTAL_CHUNKS;i++){
-        int payload=(i<CHUNKS_FULL)?CHUNK_DATA:CHUNK_LAST;
-        uint8_t seq=0x01+i;
-        uint8_t cmd=(i==0)?0xF0:((i==TOTAL_CHUNKS-1)?0xF2:0xF1);
-        uint8_t hdr[8]={0x55,0xA3,cmd,seq,0,0,0,0};
-        if (send_packet(o,hdr,fb+off,payload)!=0) return -1;
-        off+=payload;
-    }
-    return 0;
+static void human_bytes(char *out, size_t outsz, uint64_t b){
+    const char *u[]={"B","KiB","MiB","GiB","TiB"};
+    double v=(double)b; int i=0; while (v>=1024.0 && i<4){ v/=1024.0; i++; }
+    snprintf(out,outsz,"%.1f %s",v,u[i]);
 }
 
-// --------- MAIN ----------
+static volatile sig_atomic_t g_stop = 0;
+static void on_sigint(int s){ (void)s; g_stop=1; }
+
+/* ===================== Main render loop ===================== */
+
 int main(void){
-    char up[64], ld[64]; get_uptime(up,sizeof(up)); get_load(ld,sizeof(ld));
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM,on_sigint);
 
-    static uint8_t fb_portrait[PR_SIZE];
-    static uint8_t fb_landscape[FB_SIZE];
+    lcd_fd = open(UHID_PATH, O_WRONLY);
+    if (lcd_fd < 0){
+        perror("open /dev/uhidN (use o N correto; precisa permissão/root)");
+        return 1;
+    }
 
-    const uint16_t BG  = RGB565(0,0,0);
-    const uint16_t FG  = RGB565(0,220,0);
-    const uint16_t FG2 = RGB565(80,160,80);
+    /* Inicial: orientação + acertar horário + 1º heartbeat */
+    if (!lcd_set_orientation(0x01)){ fprintf(stderr,"set_orientation falhou\n"); }
+    if (!lcd_set_time_or_heartbeat(true)){ fprintf(stderr,"set_time falhou\n"); }
+    if (!lcd_set_time_or_heartbeat(false)){ fprintf(stderr,"heartbeat falhou\n"); }
 
-    fb_clear(fb_portrait, PR_W, PR_H, BG);
+    uint8_t *frame = (uint8_t*)calloc(FRAME_BYTES,1);
+    if (!frame){ fprintf(stderr,"sem memória\n"); return 1; }
 
-    // layout retrato (170x320) — onde hoje aparece legível pra você
-    draw_text(fb_portrait, 6,  18,  "UPTIME", 2, FG,  BG);
-    draw_text(fb_portrait, 6,  50,  up+7,     2, FG,  BG); // pula "UPTIME "
-    draw_text(fb_portrait, 6, 108,  "LOAD",   2, FG,  BG);
-    draw_text(fb_portrait, 6, 140,  ld+5,     2, FG,  BG); // pula "LOAD "
-    draw_text(fb_portrait, 92, 4,   "OPNSENSE", 1, FG2, BG);
+    struct timespec ts_last_hb={0}, ts_now={0};
+    clock_gettime(CLOCK_MONOTONIC, &ts_last_hb);
 
-    // gira para landscape 320x170 (igual ao que o painel espera)
-    rotate_portrait_to_landscape(fb_portrait, fb_landscape);
+    while (!g_stop){
+        /* ===== Coleta métricas ===== */
+        double cpu = get_cpu_percent();
+        mem_info_t mi; get_mem_info(&mi);
+        disk_info_t di; get_disk_root(&di);
+        double tc = read_temp_c();
 
-    // USB
-    libusb_context *ctx=NULL;
-    if (libusb_init(&ctx)!=0) errx(1,"libusb_init");
-    libusb_device_handle *h=libusb_open_device_with_vid_pid(ctx,VID,PID);
-    if (!h) errx(1,"nao encontrou 04D9:FD01");
-    struct usb_out o={.h=h,.ifnum=-1,.ep_out=0};
+        /* ===== Desenha ===== */
+        /* fundo */
+        fill_rect(frame, 0, 0, WIDTH, HEIGHT, rgb_u8(0,0,0));
 
-    if (find_hid_out(h,&o)!=0) errx(1,"endpoint OUT HID nao encontrado");
-    if (libusb_claim_interface(h,o.ifnum)!=0) errx(1,"claim interface");
+        /* Título */
+        draw_text(frame, 8, 8, "S1 STATS", rgb_u8(255,255,255), rgb_u8(0,0,0));
 
-    // ordem que remove o banner: orientação -> heartbeat -> redraw -> heartbeat
-    if (cmd_orientation(&o,0x02)!=0) warnx("orientation");
-    time_t now=time(NULL); struct tm tmn; localtime_r(&now,&tmn);
-    if (cmd_time(&o,&tmn)!=0) warnx("time1");
+        /* CPU */
+        char buf[64];
+        snprintf(buf,sizeof buf,"CPU %3.0f%%", cpu);
+        draw_text(frame, 8, 28, "CPU", rgb_u8(180,220,255), rgb_u8(0,0,0));
+        draw_bar(frame, 60, 28, 240, 10, (int)(cpu+0.5), rgb_u8(80,200,255), rgb_u8(20,40,60), rgb_u8(120,160,200));
+        draw_text(frame, 8, 42, buf, rgb_u8(220,220,220), rgb_u8(0,0,0));
 
-    if (cmd_redraw_27(&o,fb_landscape)!=0) warnx("redraw");
+        /* RAM */
+        char t[32], u[32], a[32];
+        human_bytes(t,sizeof t, mi.total);
+        human_bytes(u,sizeof u, mi.used);
+        human_bytes(a,sizeof a, mi.avail);
+        int ram_pct = (mi.total? (int)((mi.used*100.0)/mi.total+0.5):0);
+        draw_text(frame, 8, 60, "RAM", rgb_u8(180,255,180), rgb_u8(0,0,0));
+        draw_bar(frame, 60, 60, 240, 10, ram_pct, rgb_u8(120,255,120), rgb_u8(16,40,16), rgb_u8(80,140,80));
+        snprintf(buf,sizeof buf,"%s used / %s", u, t);
+        draw_text(frame, 8, 74, buf, rgb_u8(220,220,220), rgb_u8(0,0,0));
+        snprintf(buf,sizeof buf,"%s avail", a);
+        draw_text(frame, 8, 86, buf, rgb_u8(170,200,170), rgb_u8(0,0,0));
 
-    if (cmd_time(&o,&tmn)!=0) warnx("time2");
+        /* DISK / */
+        human_bytes(t,sizeof t, di.total);
+        human_bytes(u,sizeof u, di.used);
+        human_bytes(a,sizeof a, di.avail);
+        int disk_pct = (di.total? (int)((di.used*100.0)/di.total+0.5):0);
+        draw_text(frame, 8, 104, "DISK", rgb_u8(255,220,180), rgb_u8(0,0,0));
+        draw_bar(frame, 60, 104, 240, 10, disk_pct, rgb_u8(255,200,120), rgb_u8(40,28,16), rgb_u8(180,140,90));
+        snprintf(buf,sizeof buf,"%s used / %s", u, t);
+        draw_text(frame, 8, 118, buf, rgb_u8(220,220,220), rgb_u8(0,0,0));
+        snprintf(buf,sizeof buf,"%s free", a);
+        draw_text(frame, 8, 130, buf, rgb_u8(200,180,150), rgb_u8(0,0,0));
 
-    libusb_release_interface(h,o.ifnum);
-    libusb_close(h);
-    libusb_exit(ctx);
+        /* TEMP */
+        draw_text(frame, 8, 148, "TEMP", rgb_u8(255,180,180), rgb_u8(0,0,0));
+        if (tc > -200.0) {
+            snprintf(buf,sizeof buf,"CPU %.1f C", tc);
+        } else {
+            snprintf(buf,sizeof buf,"CPU N/A");
+        }
+        draw_text(frame, 60, 148, buf, rgb_u8(255,200,200), rgb_u8(0,0,0));
+
+        /* ===== Envio ===== */
+        if (!lcd_redraw(frame)){
+            fprintf(stderr,"lcd_redraw falhou\n");
+        }
+
+        /* Heartbeat a cada ~1s (README recomenda 1s para não “travar”) */
+        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+        long ms = (ts_now.tv_sec - ts_last_hb.tv_sec)*1000L +
+                  (ts_now.tv_nsec - ts_last_hb.tv_nsec)/1000000L;
+        if (ms >= HEARTBEAT_MS){
+            if (!lcd_set_time_or_heartbeat(false)){
+                fprintf(stderr,"heartbeat falhou\n");
+            }
+            ts_last_hb = ts_now;
+        }
+
+        /* Ritmo de atualização das métricas / tela */
+        usleep(UPDATE_MS*1000);
+    }
+
+    free(frame);
+    close(lcd_fd);
     return 0;
 }
