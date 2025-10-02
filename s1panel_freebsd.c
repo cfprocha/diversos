@@ -1,5 +1,5 @@
-// s1panel_freebsd.c — utilitário minimalista p/ ACEMAGIC S1 no FreeBSD
-// Compilar:
+// s1panel_freebsd.c — utilitário minimalista p/ ACEMAGIC S1 no FreeBSD/OPNsense
+// Compilar na VM FreeBSD e copiar o binário p/ OPNsense:
 //   cc -O2 -Wall -I/usr/local/include -L/usr/local/lib -lusb \
 //      -o /usr/local/bin/s1panel_freebsd /usr/local/src/s1panel_freebsd.c
 
@@ -11,15 +11,15 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <string.h>  
-#include <stdlib.h> 
+#include <string.h>
+#include <stdlib.h>   // getloadavg
 #include <time.h>
 #include <unistd.h>
 
 #define VID 0x04d9
 #define PID 0xfd01
 
-// Dimensões do LCD: 320x170, RGB565
+// LCD 320x170, RGB565
 #define LCD_W 320
 #define LCD_H 170
 #define BYTES_PER_PIXEL 2
@@ -27,9 +27,11 @@
 
 // Pacotes: 8 bytes cabeçalho + até 4096 bytes de dados
 #define CHUNK_DATA 4096
-#define CHUNK_TOTAL (8 + CHUNK_DATA)
+#define CHUNKS_FULL 26
+#define CHUNK_LAST  2304
+#define TOTAL_CHUNKS 27  // 26 cheios + 1 final
 
-// ---- Fonte 5x7 (subset necessário) ----
+// ---- Fonte 5x7 (subset suficiente) ----
 static const uint8_t font5x7[][7] = {
  {0x00,0x00,0x00,0x00,0x00}, // [32] espaço
  // '0'..'9'
@@ -58,6 +60,7 @@ static const uint8_t font5x7[][7] = {
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b){
     return (uint16_t)(((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F));
 }
+// A tela do S1 espera bytes em ordem "LE" por pixel; fazemos swap para mandar como no firmware.
 static inline uint16_t swap16(uint16_t v){ return (uint16_t)((v>>8) | (v<<8)); }
 
 static void fb_clear(uint8_t *fb, uint16_t color){
@@ -76,7 +79,6 @@ static inline void putpx(uint8_t *fb, int x, int y, uint16_t color){
     fb[off+1] = (uint8_t)(c >> 8);
 }
 
-// Desenha caractere 5x7
 static void draw_char(uint8_t *fb, int x, int y, char ch, int scale, uint16_t fg, uint16_t bg){
     const uint8_t *glyph=NULL;
     if (ch==' '){
@@ -121,7 +123,7 @@ static void draw_text(uint8_t *fb, int x, int y, const char *s, int scale, uint1
     }
 }
 
-// --------- Coletas (uptime, load) ----------
+// --------- Coletas ----------
 static void get_uptime(char *buf, size_t bufsz){
     struct timespec boottime;
     size_t len = sizeof(boottime);
@@ -154,9 +156,6 @@ struct usb_out {
 
 static int find_hid_out_ep(libusb_device_handle *h, struct usb_out *out){
     libusb_device *dev = libusb_get_device(h);
-    struct libusb_device_descriptor dd;
-    if (libusb_get_device_descriptor(dev, &dd) != 0) return -1;
-
     struct libusb_config_descriptor *cfg = NULL;
     if (libusb_get_active_config_descriptor(dev, &cfg) != 0) return -1;
 
@@ -171,8 +170,7 @@ static int find_hid_out_ep(libusb_device_handle *h, struct usb_out *out){
                     if ((ep->bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_OUT){
                         out->interface_number = alt->bInterfaceNumber;
                         out->ep_out = ep->bEndpointAddress;
-                        found = 0;
-                        break;
+                        found = 0; break;
                     }
                 }
             }
@@ -182,15 +180,16 @@ static int find_hid_out_ep(libusb_device_handle *h, struct usb_out *out){
     return found;
 }
 
+// Envia 1 pacote (8 header + payload; payload zerado até 4096)
 static int send_packet(struct usb_out *U, const uint8_t header[8], const uint8_t *data, int datalen){
-    uint8_t buf[CHUNK_TOTAL];
+    static uint8_t buf[8 + CHUNK_DATA];
     int xfer=0, r=0;
     if (datalen > CHUNK_DATA) datalen = CHUNK_DATA;
     memcpy(buf, header, 8);
     if (datalen>0) memcpy(buf+8, data, datalen);
     if (datalen<CHUNK_DATA) memset(buf+8+datalen, 0x00, CHUNK_DATA - datalen);
-    r = libusb_interrupt_transfer(U->h, U->ep_out, buf, sizeof(buf), &xfer, 1000);
-    if (r != 0 || xfer != (int)sizeof(buf)) return -1;
+    r = libusb_interrupt_transfer(U->h, U->ep_out, buf, 8+CHUNK_DATA, &xfer, 1000);
+    if (r != 0 || xfer != 8+CHUNK_DATA) return -1;
     return 0;
 }
 
@@ -207,44 +206,42 @@ static int cmd_set_time(struct usb_out *U, const struct tm *tmnow){
     return send_packet(U, hdr, NULL, 0);
 }
 
-static int cmd_redraw_full(struct usb_out *U, const uint8_t *fb, size_t fbsize){
-    size_t sent = 0;
-    uint8_t seq = 0x01;
-    while (sent < fbsize) {
-        size_t left = fbsize - sent;
-        int payload = (left >= CHUNK_DATA) ? CHUNK_DATA : (int)left;
-        uint8_t cmd = (seq==0x01) ? 0xF0 : 0xF1; // start ou continue
-        if (sent + payload >= fbsize) cmd = 0xF2; // end
-        uint16_t off = (uint16_t)(sent / 256);
-        uint16_t len = (uint16_t)(payload/256);
-        uint8_t hdr[8] = {0x55, 0xA3, cmd, seq,
-                          (uint8_t)(off & 0xFF), (uint8_t)(off>>8),
-                          (uint8_t)(len & 0xFF), (uint8_t)(len>>8)};
-        if (send_packet(U, hdr, fb + sent, payload) != 0) return -1;
-        sent += payload;
-        seq++;
-        if (seq > 0x1B) break; // segurança
+// Redraw: exatamente 27 pacotes (26×4096 + 1×2304), seq 0x01..0x1B
+static int cmd_redraw_full_fixed(struct usb_out *U, const uint8_t *fb){
+    size_t offset = 0;
+    for (int i = 0; i < TOTAL_CHUNKS; ++i) {
+        int payload = (i < CHUNKS_FULL) ? CHUNK_DATA : CHUNK_LAST;
+        uint8_t seq = 0x01 + i;
+        uint8_t cmd = (i == 0) ? 0xF0 : ((i == TOTAL_CHUNKS-1) ? 0xF2 : 0xF1);
+        // offsets/len no header não são validados pelo firmware; mandar zeros é aceito
+        uint8_t hdr[8] = {0x55, 0xA3, cmd, seq, 0x00,0x00,0x00,0x00};
+        if (send_packet(U, hdr, fb + offset, payload) != 0) return -1;
+        offset += payload;
     }
     return 0;
 }
 
 int main(void){
+    // 1) Texto
     char line1[64], line2[64];
     get_uptime(line1, sizeof(line1));
     get_load(line2, sizeof(line2));
 
+    // 2) Framebuffer
     static uint8_t fb[FB_SIZE];
     uint16_t black = rgb565(0,0,0);
     uint16_t white = rgb565(31,63,31);
     uint16_t gray  = rgb565(8,16,8);
 
     fb_clear(fb, black);
-    draw_text(fb, 6, 10, "UPTIME", 2, white, black);
-    draw_text(fb, 6, 40, line1 + 7, 2, white, black); // pula "UPTIME "
-    draw_text(fb, 6, 80, "LOAD", 2, white, black);
-    draw_text(fb, 6, 110, line2 + 5, 2, white, black); // pula "LOAD "
-    draw_text(fb, 6, 148, "OPNSENSE", 1, gray, black);
+    // Layout simples em landscape
+    draw_text(fb, 8, 20,  "UPTIME", 2, white, black);
+    draw_text(fb, 8, 52,  line1 + 7, 2, white, black); // pula "UPTIME "
+    draw_text(fb, 8, 100, "LOAD",   2, white, black);
+    draw_text(fb, 8, 132, line2 + 5, 2, white, black); // pula "LOAD "
+    draw_text(fb, 240, 4, "OPNSENSE", 1, gray, black);
 
+    // 3) USB
     libusb_context *ctx=NULL;
     if (libusb_init(&ctx) != 0) errx(1, "libusb_init falhou");
     libusb_device_handle *h = libusb_open_device_with_vid_pid(ctx, VID, PID);
@@ -254,11 +251,14 @@ int main(void){
     if (find_hid_out_ep(h, &U) != 0) errx(1, "nao achei endpoint OUT HID");
     if (libusb_claim_interface(h, U.interface_number) != 0) errx(1, "claim interface falhou");
 
-    if (cmd_set_orientation(&U, 0x02) != 0) warnx("set_orientation falhou");
+    // **Landscape** (0x01) p/ texto "em pé" correto no S1
+    if (cmd_set_orientation(&U, 0x01) != 0) warnx("set_orientation falhou");
+
     time_t now = time(NULL);
     struct tm tmnow; localtime_r(&now, &tmnow);
     if (cmd_set_time(&U, &tmnow) != 0) warnx("set_time falhou");
-    if (cmd_redraw_full(&U, fb, FB_SIZE) != 0) warnx("redraw falhou");
+
+    if (cmd_redraw_full_fixed(&U, fb) != 0) warnx("redraw falhou");
 
     libusb_release_interface(h, U.interface_number);
     libusb_close(h);
