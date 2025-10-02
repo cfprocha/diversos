@@ -8,3 +8,5 @@ O arquivo [CxEletronico.c](https://github.com/cfprocha/diversos/blob/main/CxElet
 Os arquivos [CxEletr.html](https://github.com/cfprocha/diversos/blob/main/CxEletr.html) e [CxEletr.js](https://github.com/cfprocha/diversos/blob/main/CxEletr.js) representam respectivamente a página web para a solução do caixa eletrônico e o código JavaScript que soluciona o problema. Essa versão é ainda mais enxuta do que a realizada com a linguagem C. 
 
 Os arquivos da pasta [cadastro](https://github.com/cfprocha/diversos/tree/main/cadastro) representam uma aplicação muito simples de cadastro de nome e idade, em PHP com MariaDB.
+
+O arquivo [s1panel_freebsd.c](https://github.com/cfprocha/diversos/blob/main/s1panel_freebsd.c) cria uma tela com sensores para o Acemagic S1, similar à original do Windows 11, mas para rodar no freeBSD.
