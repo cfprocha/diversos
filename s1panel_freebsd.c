@@ -19,9 +19,9 @@
 #define VID 0x04d9
 #define PID 0xfd01
 
-// O painel é fisicamente 170x320 (retrato). Mantemos essa base.
-#define LCD_W 170
-#define LCD_H 320
+// Painel: 320x170 (LANDSCAPE), RGB565 LITTLE-ENDIAN (lo,hi)
+#define LCD_W 320
+#define LCD_H 170
 #define FB_SIZE (LCD_W*LCD_H*2)
 
 #define CHUNK_DATA   4096
@@ -53,19 +53,24 @@ static const uint8_t font5x7[][7] = {
  {0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43}
 };
 
-static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b){
-    return (uint16_t)(((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F));
+static inline uint16_t RGB565(uint8_t r8, uint8_t g8, uint8_t b8){
+    // map 8-bit to 5/6/5
+    uint16_t r = (r8 >> 3) & 0x1F;
+    uint16_t g = (g8 >> 2) & 0x3F;
+    uint16_t b = (b8 >> 3) & 0x1F;
+    return (uint16_t)((r<<11) | (g<<5) | b);
 }
-// O firmware espera RGB565 little-endian por pixel (low,high). Não fazer swap.
-static inline void fb_clear(uint8_t *fb, uint16_t color){
-    uint8_t lo = (uint8_t)(color & 0xFF), hi = (uint8_t)(color >> 8);
-    for (size_t i=0;i<FB_SIZE;i+=2){ fb[i]=lo; fb[i+1]=hi; }
-}
-static inline void putpx(uint8_t *fb, int x, int y, uint16_t color){
+
+static inline void putpx(uint8_t *fb, int x, int y, uint16_t c){
     if (x<0||x>=LCD_W||y<0||y>=LCD_H) return;
     size_t off = (y*LCD_W + x)*2;
-    fb[off]   = (uint8_t)(color & 0xFF);
-    fb[off+1] = (uint8_t)(color >> 8);
+    fb[off]   = (uint8_t)(c & 0xFF);   // little-endian
+    fb[off+1] = (uint8_t)(c >> 8);
+}
+
+static void fb_clear(uint8_t *fb, uint16_t c){
+    uint8_t lo = c & 0xFF, hi = c >> 8;
+    for (size_t i=0;i<FB_SIZE;i+=2){ fb[i]=lo; fb[i+1]=hi; }
 }
 
 static void draw_char(uint8_t *fb, int x, int y, char ch, int scale, uint16_t fg, uint16_t bg){
@@ -78,10 +83,8 @@ static void draw_char(uint8_t *fb, int x, int y, char ch, int scale, uint16_t fg
     }
     if (ch>='0'&&ch<='9') g=font5x7[(ch-'0')+(48-32)];
     else if (ch==':')     g=font5x7[(58-32)];
-    else {
-        char up=(ch>='a'&&ch<='z')?(ch-32):ch;
-        if (up>='A'&&up<='Z') g=font5x7[(up-'A')+(65-32)];
-    }
+    else { char up=(ch>='a'&&ch<='z')?(ch-32):ch;
+           if (up>='A'&&up<='Z') g=font5x7[(up-'A')+(65-32)]; }
     if (!g){
         for(int dx=0; dx<6*scale; ++dx)
             for(int dy=0; dy<7*scale; ++dy)
@@ -150,7 +153,6 @@ static int xfer(libusb_device_handle *h, unsigned char ep, const void *buf, int 
     int x=0,r=libusb_interrupt_transfer(h,ep,(unsigned char*)buf,len,&x,1000);
     return (r==0 && x==len)?0:-1;
 }
-
 static int send_packet(struct usb_out *o, const uint8_t hdr[8], const uint8_t *data, int datalen){
     static uint8_t buf[8+CHUNK_DATA];
     if (datalen>CHUNK_DATA) datalen=CHUNK_DATA;
@@ -160,9 +162,8 @@ static int send_packet(struct usb_out *o, const uint8_t hdr[8], const uint8_t *d
     return xfer(o->h,o->ep_out,buf,8+CHUNK_DATA);
 }
 
-static int cmd_orientation(struct usb_out *o, uint8_t mode){
-    uint8_t hdr[8]={0x55,0xA1,0xF1,mode,0,0,0,0}; // 0x02 = portrait
-    return send_packet(o,hdr,NULL,0);
+static int cmd_orientation(struct usb_out *o, uint8_t mode){ // 0x01 = landscape
+    uint8_t hdr[8]={0x55,0xA1,0xF1,mode,0,0,0,0}; return send_packet(o,hdr,NULL,0);
 }
 static int cmd_time(struct usb_out *o, const struct tm *tmn){
     uint8_t hdr[8]={0x55,0xA1,0xF2,(uint8_t)tmn->tm_hour,(uint8_t)tmn->tm_min,(uint8_t)tmn->tm_sec,0,0};
@@ -181,24 +182,34 @@ static int cmd_redraw_27(struct usb_out *o, const uint8_t *fb){
     return 0;
 }
 
+// --------- MAIN ----------
 int main(void){
-    // texto
     char up[64], ld[64]; get_uptime(up,sizeof(up)); get_load(ld,sizeof(ld));
 
-    // framebuffer (fundo, títulos e valores)
     static uint8_t fb[FB_SIZE];
-    uint16_t BG  = rgb565(0,0,0);
-    uint16_t FG  = rgb565(0,63,0);   // verde
-    uint16_t FG2 = rgb565(6,20,6);   // cinza-esverdeado
+    const uint16_t BG  = RGB565(0,0,0);
+    const uint16_t FG  = RGB565(0,220,0);   // verde vivo
+    const uint16_t FG2 = RGB565(80,160,80); // subtítulo
 
+    // Fundo
     fb_clear(fb,BG);
-    // layout em retrato: 170x320
-    draw_text(fb, 6, 18,  "UPTIME", 2, FG,  BG);
-    draw_text(fb, 6, 50,  up+7,     2, FG,  BG); // pula "UPTIME "
-    draw_text(fb, 6, 108, "LOAD",   2, FG,  BG);
-    draw_text(fb, 6, 140, ld+5,     2, FG,  BG); // pula "LOAD "
-    draw_text(fb, 90, 4,  "OPNSENSE", 1, FG2, BG);
 
+    // Layout limpo (LANDSCAPE 320x170)
+    // Cabeçalho:
+    //  UPTIME    2x
+    //  XXd HH:MM 2x
+    //  LOAD      2x
+    //  a b c     2x
+    int x0 = 10, y0 = 12;
+    // títulos
+    draw_text(fb, x0,       y0,     "UPTIME", 2, FG,  BG);
+    draw_text(fb, x0,       y0+32,  up+7,     2, FG,  BG); // pula "UPTIME "
+    draw_text(fb, x0,       y0+78,  "LOAD",   2, FG,  BG);
+    draw_text(fb, x0,       y0+110, ld+5,     2, FG,  BG); // pula "LOAD "
+    // assinatura discreta
+    draw_text(fb, LCD_W-85, 6, "OPNSENSE", 1, FG2, BG);
+
+    // USB
     libusb_context *ctx=NULL;
     if (libusb_init(&ctx)!=0) errx(1,"libusb_init");
     libusb_device_handle *h=libusb_open_device_with_vid_pid(ctx,VID,PID);
@@ -208,12 +219,10 @@ int main(void){
     if (find_hid_out(h,&o)!=0) errx(1,"endpoint OUT HID nao encontrado");
     if (libusb_claim_interface(h,o.ifnum)!=0) errx(1,"claim interface");
 
-    // painel em retrato e “heartbeat”
-    if (cmd_orientation(&o,0x02)!=0) warnx("orientation");
+    // Ordem que elimina o banner: orientação -> heartbeat -> redraw
+    if (cmd_orientation(&o,0x01)!=0) warnx("orientation");
     time_t now=time(NULL); struct tm tmn; localtime_r(&now,&tmn);
     if (cmd_time(&o,&tmn)!=0) warnx("time");
-
-    // redesenho completo (27 pacotes exatos)
     if (cmd_redraw_27(&o,fb)!=0) warnx("redraw");
 
     libusb_release_interface(h,o.ifnum);
